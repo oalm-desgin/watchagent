@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     # The poller is the only thing in the lifespan that makes outbound
     # HTTP calls; turning it off leaves the DB / engine / hydration path
     # intact for offline testing.
+    #
+    # WARNING — like every Settings field, this is overridable via
+    # ``ENABLE_POLLER=false`` in the environment. Setting that in a
+    # production ``.env`` would silently disable polling: the API would
+    # keep serving ``/health`` with the existing ``readings_stored``
+    # count frozen in time, with no error log to point at. Don't.
+    # docker-compose.yml leaves it at the default (True) on purpose.
     enable_poller: bool = True
 
     # --- Detection: per-city temperature anomaly (z-score) ---------------

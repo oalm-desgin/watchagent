@@ -123,6 +123,61 @@ class TestPollerScheduling:
         async with app.router.lifespan_context(app):
             assert not hasattr(app.state, "poller_task")
 
+    @pytest.mark.asyncio
+    async def test_silent_crash_in_poller_logs_an_error(
+        self,
+        settings_with_poller: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Tripwire test: the poller's done_callback MUST log at ERROR
+        level if the task dies for any reason other than CancelledError.
+        Without this, an exception that escapes the per-city try/except
+        would kill the task silently, /health would keep returning 200,
+        and readings_stored would freeze - the kind of failure that's
+        invisible until somebody notices the data isn't fresh."""
+        import logging
+
+        import structlog
+
+        from watchagent.poller import Poller
+
+        async def _crash_immediately(self: Poller) -> None:  # noqa: ARG001
+            raise RuntimeError("simulated unhandled poller crash")
+
+        monkeypatch.setattr(Poller, "run_forever", _crash_immediately)
+
+        # Route structlog through stdlib logging so caplog can see it.
+        # (Our production setup does the same via LoggerFactory; this
+        # just reaffirms the route is hot for the test.)
+        structlog.configure(
+            processors=[
+                structlog.processors.add_log_level,
+                structlog.processors.format_exc_info,
+                structlog.processors.JSONRenderer(),
+            ],
+            wrapper_class=structlog.stdlib.BoundLogger,
+            logger_factory=structlog.stdlib.LoggerFactory(),
+            cache_logger_on_first_use=False,
+        )
+
+        app = create_app(settings_with_poller)
+        with caplog.at_level(logging.ERROR):
+            async with app.router.lifespan_context(app):
+                # Pump the event loop so the poller starts, crashes, and
+                # the done_callback fires.
+                await asyncio.sleep(0.05)
+
+        # The structlog event name is the searchable signal.
+        assert any(
+            "poller.task_died" in record.message
+            for record in caplog.records
+        ), (
+            "Silent poller death must produce a 'poller.task_died' ERROR "
+            "log line via the task's done_callback. Without it, the "
+            "background task can crash and nobody notices."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Fail-fast hydration
@@ -162,22 +217,31 @@ class TestFailFastHydration:
         settings_no_poller: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """When hydration raises, the DB and httpx client (initialised
-        before hydration) MUST still be closed by the finally chain.
-        Otherwise a failed startup leaks file handles / sockets and
-        repeated failed restarts exhaust them."""
+        """When hydration raises, EVERY resource initialised before it
+        MUST be closed by the finally chain — DB AND http_client. A
+        chain that closes only the DB leaks httpx connection pools on
+        every failed restart; a chain that closes only the http_client
+        leaks the DB file handle. Both must be released."""
+        import httpx
+
         from watchagent.detection.engine import DetectionEngine
         from watchagent.storage import Database
 
         closed: list[str] = []
 
         original_db_close = Database.close
+        original_aclose = httpx.AsyncClient.aclose
 
         async def _track_db_close(self: Database) -> None:
             closed.append("db")
             await original_db_close(self)
 
+        async def _track_aclose(self: httpx.AsyncClient) -> None:
+            closed.append("http_client")
+            await original_aclose(self)
+
         monkeypatch.setattr(Database, "close", _track_db_close)
+        monkeypatch.setattr(httpx.AsyncClient, "aclose", _track_aclose)
 
         async def _kaboom(self: DetectionEngine) -> None:  # noqa: ARG001
             raise RuntimeError("nope")
@@ -189,10 +253,63 @@ class TestFailFastHydration:
             async with app.router.lifespan_context(app):
                 pass  # never reached
 
-        assert "db" in closed, (
-            "DB initialised before hydration MUST be closed in the "
-            "finally chain even when hydration raised. Without this, "
-            "a hydration failure leaks the DB file handle."
+        # Both must have been closed. Order matters too: cleanup is
+        # reverse of registration, so http_client is closed BEFORE db.
+        assert closed == ["http_client", "db"], (
+            f"Cleanup chain must close every initialised resource in "
+            f"reverse order, even when startup fails. Got: {closed}. "
+            "Missing http_client means leaked connection pools on every "
+            "failed restart; missing db means a leaked file handle."
+        )
+
+    @pytest.mark.asyncio
+    async def test_engine_construction_failure_still_closes_db_and_http(
+        self,
+        settings_no_poller: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The cleanup chain must work the same way for ANY failure
+        stage. Here we induce the failure at engine construction (before
+        hydration even runs) and assert the same two resources, which
+        were registered before the failure point, are still closed."""
+        import httpx
+
+        from watchagent.detection import engine as engine_mod
+        from watchagent.storage import Database
+
+        closed: list[str] = []
+        original_db_close = Database.close
+        original_aclose = httpx.AsyncClient.aclose
+
+        async def _track_db_close(self: Database) -> None:
+            closed.append("db")
+            await original_db_close(self)
+
+        async def _track_aclose(self: httpx.AsyncClient) -> None:
+            closed.append("http_client")
+            await original_aclose(self)
+
+        monkeypatch.setattr(Database, "close", _track_db_close)
+        monkeypatch.setattr(httpx.AsyncClient, "aclose", _track_aclose)
+
+        # Induce failure at the next stage (DetectionEngine construction).
+        # By the time this fires, db and http_client are both registered.
+        original_init = engine_mod.DetectionEngine.__init__
+
+        def _bad_init(self: engine_mod.DetectionEngine, **kwargs: object) -> None:
+            original_init(self, **kwargs)  # type: ignore[arg-type]
+            raise RuntimeError("engine construction deliberately broken")
+
+        monkeypatch.setattr(engine_mod.DetectionEngine, "__init__", _bad_init)
+
+        app = create_app(settings_no_poller)
+        with pytest.raises(RuntimeError, match="engine construction"):
+            async with app.router.lifespan_context(app):
+                pass
+
+        assert closed == ["http_client", "db"], (
+            "Engine-stage failure must still trigger reverse cleanup of "
+            f"the resources registered earlier. Got: {closed}."
         )
 
 

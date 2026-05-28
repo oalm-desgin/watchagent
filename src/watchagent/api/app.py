@@ -140,6 +140,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     poller.run_forever(),
                     name="watchagent-poller",
                 )
+
+                # Silent-crash tripwire. Without this, an exception that
+                # somehow escaped the poller's per-city try/except would
+                # kill the task, the GC would eventually warn "Task
+                # exception was never retrieved" to stderr (easy to miss
+                # in JSON-log streams), /health would keep returning 200,
+                # and readings_stored would silently stop growing. With
+                # the callback, an unexpected exception is a single
+                # ERROR-level structured log line, immediately.
+                #
+                # CancelledError is the normal shutdown path - we filter
+                # it out so a clean stop doesn't generate a false alarm.
+                def _on_poller_done(task: asyncio.Task[None]) -> None:
+                    if task.cancelled():
+                        return
+                    exc = task.exception()
+                    if exc is not None:
+                        log.error(
+                            "poller.task_died",
+                            exc_info=exc,
+                            note=(
+                                "background poller crashed; the API will "
+                                "keep responding but no new readings will "
+                                "be polled until the process is restarted"
+                            ),
+                        )
+
+                poller_task.add_done_callback(_on_poller_done)
                 app.state.poller = poller
                 app.state.poller_task = poller_task
 
