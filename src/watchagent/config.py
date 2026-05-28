@@ -36,6 +36,23 @@ class Settings(BaseSettings):
     # --- Logging ----------------------------------------------------------
     log_level: str = Field("INFO")
 
+    # --- HTTP server -----------------------------------------------------
+    # The bind address used by ``python -m watchagent``. ``0.0.0.0`` is
+    # required for Docker port-mapping to reach the process; for a pure
+    # local run, ``127.0.0.1`` is safer but the same default keeps
+    # parity with the container.
+    api_host: str = "0.0.0.0"
+    api_port: int = Field(8000, ge=1, le=65535)
+
+    # --- Test escape hatch -----------------------------------------------
+    # Controls whether the lifespan launches the background poller. Always
+    # True in production (and in docker-compose); set to False in unit
+    # tests so the contract suite doesn't hit Open-Meteo on every run.
+    # The poller is the only thing in the lifespan that makes outbound
+    # HTTP calls; turning it off leaves the DB / engine / hydration path
+    # intact for offline testing.
+    enable_poller: bool = True
+
     # --- Detection: per-city temperature anomaly (z-score) ---------------
     w: int = Field(48, gt=1, description="rolling window size per city")
     min_samples: int = Field(6, ge=2, description="warm-up sample threshold")

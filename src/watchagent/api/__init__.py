@@ -35,4 +35,12 @@ from __future__ import annotations
 
 from .app import create_app
 
-__all__ = ["create_app"]
+# Module-level app for ``uvicorn watchagent.api:app``. Constructed eagerly
+# at import time, which is intentional: invalid env-driven Settings should
+# blow up the import (and therefore the process) rather than start a
+# zombie app that 500s every request. The lifespan does NOT run at import
+# time — uvicorn drives it on startup, and tests construct their own
+# fresh instances via ``create_app(settings)``.
+app = create_app()
+
+__all__ = ["app", "create_app"]

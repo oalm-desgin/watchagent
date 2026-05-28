@@ -32,8 +32,13 @@ from watchagent.storage import Database, Event, Reading
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    """Settings with a per-test DB path so each test is fully isolated."""
-    return Settings(db_path=str(tmp_path / "api.db"))
+    """Settings with a per-test DB path so each test is fully isolated.
+
+    ``enable_poller=False`` keeps the lifespan from launching a real
+    Open-Meteo client during contract tests — offline by default.
+    M9's integration suite re-enables it with a respx-mocked transport.
+    """
+    return Settings(db_path=str(tmp_path / "api.db"), enable_poller=False)
 
 
 @pytest_asyncio.fixture
