@@ -1,0 +1,70 @@
+# Container orchestration for WatchAgent.
+#
+# What the §1 "fresh clone" check expects:
+#
+#   git clone <url>
+#   cp .env.example .env       # OR skip — see env_file note below
+#   docker compose up --build  # GET /health works
+#   docker compose down        # no -v
+#   docker compose up          # GET /health shows persisted readings_stored
+#
+# The named volume (`watchagent-data`) is what makes the persistence
+# half work. `docker compose down` (no -v) preserves it; `docker compose
+# down -v` would wipe it on purpose.
+#
+# DB_PATH is set TWICE on purpose: once in the Dockerfile (so direct
+# `docker run` works) and once here in `environment:` (so this file is
+# self-contained and a reviewer reading docker-compose.yml in isolation
+# can see exactly what path the DB lands at). `environment:` always
+# wins over `env_file:`, so a stray DB_PATH in the user's local .env
+# can never sneak the DB inside the container.
+
+services:
+  watchagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: watchagent:dev
+    container_name: watchagent
+    ports:
+      # Host:container. 8000 is the documented default; users can
+      # override the host side via API_PORT in .env or by editing this.
+      - "${API_PORT_HOST:-8000}:8000"
+
+    # User-overridable knobs come from the local .env (gitignored, copied
+    # from .env.example by the user on first setup). This is OPTIONAL —
+    # the image has sane defaults for everything except DB_PATH (which
+    # is overridden below to point at the volume).
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # Critical: DB_PATH MUST point inside the named-volume mount point
+      # for persistence to work across `docker compose down` + `up`. We
+      # set it here unconditionally so a stale local .env can never
+      # overrule it (compose semantics: `environment:` > `env_file:`).
+      DB_PATH: /data/watchagent.db
+      # Always run the poller in a real container deployment. If a user
+      # set ENABLE_POLLER=false in .env, env_file would carry it through
+      # — pinning True here closes that hole.
+      ENABLE_POLLER: "true"
+
+    volumes:
+      - watchagent-data:/data
+
+    restart: unless-stopped
+
+    # Match the Dockerfile's HEALTHCHECK with a slightly more generous
+    # start_period: hydration over a populated DB on a slow host can
+    # take a few extra seconds.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2.5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  watchagent-data:
+    name: watchagent-data
