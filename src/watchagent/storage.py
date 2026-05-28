@@ -338,24 +338,46 @@ class Database:
     # ----- reads --------------------------------------------------------
 
     async def select_readings(
-        self, *, city: str | None = None, limit: int = 50
+        self,
+        *,
+        city: str | None = None,
+        since: str | None = None,
+        limit: int = 50,
     ) -> list[Reading]:
-        """Most-recent-first by ``reading_time_utc`` (cross-city correct)."""
+        """Most-recent-first by ``reading_time_utc`` (cross-city correct).
+
+        ``since`` filters to ``reading_time_utc >= since``. The format MUST
+        match the column's: ``"2026-05-28T15:00:00+00:00"``. The API layer
+        normalises user input before passing it in, so callers here can
+        trust the comparison is a simple string predicate (the column
+        format guarantees TEXT sort = chronological sort).
+        """
+        clauses: list[str] = []
+        params_list: list[Any] = []
         if city is not None:
-            sql = (
-                "SELECT * FROM readings WHERE city = ? "
-                "ORDER BY reading_time_utc DESC LIMIT ?"
-            )
-            params: tuple[Any, ...] = (city, limit)
-        else:
-            sql = "SELECT * FROM readings ORDER BY reading_time_utc DESC LIMIT ?"
-            params = (limit,)
-        async with self.connection.execute(sql, params) as cur:
+            clauses.append("city = ?")
+            params_list.append(city)
+        if since is not None:
+            clauses.append("reading_time_utc >= ?")
+            params_list.append(since)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        sql = (
+            f"SELECT * FROM readings {where}"
+            "ORDER BY reading_time_utc DESC LIMIT ?"
+        )
+        params_list.append(limit)
+        async with self.connection.execute(sql, tuple(params_list)) as cur:
             rows = await cur.fetchall()
         return [Reading.from_row(r) for r in rows]
 
     async def select_events(
-        self, *, city: str | None = None, limit: int = 50
+        self,
+        *,
+        city: str | None = None,
+        event_type: str | None = None,
+        severity: str | None = None,
+        since: str | None = None,
+        limit: int = 50,
     ) -> list[Event]:
         """Most-recent-first by ``reading_time_utc`` (cross-city correct).
 
@@ -365,16 +387,27 @@ class Database:
         state-hydration replay (M5) ordering by ``detected_at`` would mix
         replayed and live events. ``reading_time_utc`` is the stable choice.
         """
+        clauses: list[str] = []
+        params_list: list[Any] = []
         if city is not None:
-            sql = (
-                "SELECT * FROM events WHERE city = ? "
-                "ORDER BY reading_time_utc DESC LIMIT ?"
-            )
-            params: tuple[Any, ...] = (city, limit)
-        else:
-            sql = "SELECT * FROM events ORDER BY reading_time_utc DESC LIMIT ?"
-            params = (limit,)
-        async with self.connection.execute(sql, params) as cur:
+            clauses.append("city = ?")
+            params_list.append(city)
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params_list.append(event_type)
+        if severity is not None:
+            clauses.append("severity = ?")
+            params_list.append(severity)
+        if since is not None:
+            clauses.append("reading_time_utc >= ?")
+            params_list.append(since)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        sql = (
+            f"SELECT * FROM events {where}"
+            "ORDER BY reading_time_utc DESC LIMIT ?"
+        )
+        params_list.append(limit)
+        async with self.connection.execute(sql, tuple(params_list)) as cur:
             rows = await cur.fetchall()
         return [Event.from_row(r) for r in rows]
 
