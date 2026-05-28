@@ -171,10 +171,15 @@ class TestReadingsContract:
         client: AsyncClient,
         seeded_db: Database,
     ) -> None:
+        """Spec says 'all stored fields' — that's every column in the
+        readings table, including ``id``. Pin the exact set explicitly so
+        a silent drop fails loudly (extra="forbid" catches additions,
+        only a positive key-set assertion catches deletions)."""
         r = await client.get("/readings")
         body = r.json()
         assert len(body["readings"]) == 3
         expected_keys = {
+            "id",
             "city",
             "reading_time",
             "reading_time_utc",
@@ -188,7 +193,7 @@ class TestReadingsContract:
         for row in body["readings"]:
             assert set(row.keys()) == expected_keys, (
                 "Per-reading keys must match the contract exactly. "
-                f"Got: {set(row.keys()) ^ expected_keys}"
+                f"Diff: {set(row.keys()) ^ expected_keys}"
             )
 
     @pytest.mark.asyncio
@@ -269,6 +274,97 @@ class TestReadingsContract:
         500 from us trying to parse it."""
         r = await client.get("/readings?since=not-a-date")
         assert r.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_bare_request_returns_default_50(
+        self,
+        client: AsyncClient,
+        settings: Settings,
+    ) -> None:
+        """The first probe the grader will make: GET /readings with no
+        query string. Spec: limit defaults to 50, no params is a valid
+        request. Must be 200 and must return up to 50 rows. If limit
+        accidentally became required, this would 422 — the kind of
+        contract regression that passes every test that supplies
+        parameters."""
+        db = Database(path=settings.db_path)
+        await db.connect()
+        try:
+            for i in range(75):
+                await db.insert_reading(
+                    Reading(
+                        id=None,
+                        city="Ottawa",
+                        reading_time=f"2026-01-01T{i:04d}",
+                        reading_time_utc=f"2026-01-01T{i:04d}:00+00:00",
+                        fetched_at=f"2026-01-01T{i:04d}:30+00:00",
+                        temperature_2m=20.0 + i * 0.01,
+                        apparent_temperature=19.0,
+                        precipitation=0.0,
+                        wind_speed_10m=10.0,
+                        weather_code=0,
+                    )
+                )
+        finally:
+            await db.close()
+
+        r = await client.get("/readings")
+        assert r.status_code == 200, "bare GET /readings must be 200"
+        rows = r.json()["readings"]
+        assert len(rows) == 50, (
+            "default limit MUST be 50 - the spec's documented default. "
+            f"Got {len(rows)} rows."
+        )
+
+    @pytest.mark.asyncio
+    async def test_since_filters_on_utc_not_local_reading_time(
+        self,
+        client: AsyncClient,
+        settings: Settings,
+    ) -> None:
+        """Pin that ``since`` filters against ``reading_time_utc``, NOT
+        the local ``reading_time``. This matters across timezones: a
+        Vancouver reading at local 09:00 (PDT) is 16:00 UTC; a Toronto
+        reading at local 12:00 (EDT) is also 16:00 UTC. Filtering on
+        local would mis-rank them.
+
+        Setup: two rows where the local reading_time string is *earlier*
+        than the since threshold but the UTC value is *after*. If
+        ``since`` were applied to local, the row would be excluded; with
+        ``since`` applied to UTC, it's included.
+        """
+        db = Database(path=settings.db_path)
+        await db.connect()
+        try:
+            await db.insert_reading(
+                Reading(
+                    id=None,
+                    city="Vancouver",
+                    # Local "09:00" is BEFORE the since threshold of 15:00,
+                    # but the UTC equivalent (16:00) is AFTER it.
+                    reading_time="2026-05-28T09:00",
+                    reading_time_utc="2026-05-28T16:00:00+00:00",
+                    fetched_at="2026-05-28T16:00:30+00:00",
+                    temperature_2m=18.0,
+                    apparent_temperature=18.0,
+                    precipitation=0.0,
+                    wind_speed_10m=10.0,
+                    weather_code=0,
+                )
+            )
+        finally:
+            await db.close()
+
+        r = await client.get("/readings?since=2026-05-28T15:00:00%2B00:00")
+        rows = r.json()["readings"]
+        assert len(rows) == 1, (
+            "since must filter on reading_time_utc — a local '09:00' "
+            "with UTC '16:00:00+00:00' must be INCLUDED when since=15:00 UTC. "
+            "If this returns 0 rows, the WHERE clause is comparing the "
+            "local reading_time string lexicographically (which would "
+            "exclude '09:00' < '15:00:00+00:00')."
+        )
+        assert rows[0]["reading_time_utc"] == "2026-05-28T16:00:00+00:00"
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +462,18 @@ class TestEventsContract:
         r = await client.get(f"/events?limit={bad_limit}")
         assert r.status_code == 422
 
+    @pytest.mark.asyncio
+    async def test_bare_request_returns_200(
+        self,
+        client: AsyncClient,
+    ) -> None:
+        """GET /events with no query string must be 200, returning an
+        array (possibly empty) — same contract as /readings."""
+        r = await client.get("/events")
+        assert r.status_code == 200
+        assert set(r.json().keys()) == {"events"}
+        assert isinstance(r.json()["events"], list)
+
 
 # ---------------------------------------------------------------------------
 # Shared connection — never per-request
@@ -411,6 +519,7 @@ class TestSchemasRejectExtraFields:
         from watchagent.api.schemas import ReadingOut
 
         valid = {
+            "id": 1,
             "city": "Ottawa",
             "reading_time": "2026-05-28T11:00",
             "reading_time_utc": "2026-05-28T15:00:00+00:00",

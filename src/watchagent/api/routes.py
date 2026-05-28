@@ -11,8 +11,12 @@ Filter semantics (consistent across endpoints):
 * ``event_type`` / ``severity`` — optional exact-match filters on
   events; same "filter, not lookup" semantics.
 * ``since`` — optional ISO-8601 datetime; rows with
-  ``reading_time_utc >= since`` are returned. The handler normalises
-  user input to the same format the DB column uses
+  ``reading_time_utc >= since`` are returned. Always compares against
+  the **UTC** column, never the local ``reading_time`` — across
+  timezones, Vancouver 09:00 (PDT) and Toronto 12:00 (EDT) are the
+  *same absolute moment* (16:00 UTC), and a since-filter that compared
+  the local strings would mis-rank readings by ~3h. The handler
+  normalises user input to the same format the DB column uses
   (``"YYYY-MM-DDTHH:MM:SS+00:00"``) so the WHERE clause is a clean
   string comparison.
 * ``limit`` — required validated bound, ``1 ≤ limit ≤ 500``.
@@ -89,7 +93,10 @@ def _normalise_since(since: datetime | None) -> str | None:
 
 
 def _reading_to_out(r) -> ReadingOut:  # noqa: ANN001 — storage.Reading dataclass
+    # storage.Reading.id is None pre-insert; on the read path (select_*)
+    # it's always populated by from_row, so int(...) is safe.
     return ReadingOut(
+        id=int(r.id),
         city=r.city,
         reading_time=r.reading_time,
         reading_time_utc=r.reading_time_utc,

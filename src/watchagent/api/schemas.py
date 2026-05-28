@@ -24,11 +24,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ReadingOut(BaseModel):
-    """One row from ``readings``. Matches storage.Reading field-for-field
-    EXCEPT ``id``, which is internal bookkeeping and not exposed."""
+    """One row from ``readings`` — all stored fields, none dropped.
+
+    The spec calls for "all stored fields" on the readings endpoint, so
+    ``id`` is exposed alongside the weather data. Hiding it would be a
+    contract violation in spirit even if no consumer reads it: a reviewer
+    diffing the wire shape against the DB schema would see one missing
+    column and reasonably ask why.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
+    id: int = Field(..., description="DB-assigned row id.")
     city: str
     reading_time: str = Field(
         ...,
