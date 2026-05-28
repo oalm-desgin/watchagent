@@ -12,21 +12,34 @@ module means:
   detector-#5 concern; precipitation/wind absolute detectors handle that.
 * Unknown codes (Open-Meteo could ship a new code one day) return ``None``
   from the lookup helpers and ``False`` from :func:`is_more_severe`. Silence
-  is safer than a false fire on data we don't recognise.
+  is safer than a false fire on data we don't recognise — but to keep the
+  silence *observable*, the FIRST time an unknown code is seen we emit a
+  one-shot INFO log (``weather_code.unknown``). Subsequent sightings of the
+  same code are deduped via :data:`_seen_unknown_codes`.
 
-Severity ordering rationale (CLEAR < … < THUNDERSTORM):
-    CLEAR        — clear sky
-    CLOUDY       — clouds, no precip
-    FOG          — visibility hazard but no precip
-    DRIZZLE      — light precip
-    RAIN         — significant precip; flooding/road-water risk
-    SNOW         — precip + driving + freeze risk (Canadian context)
-    THUNDERSTORM — precip + lightning + wind + hail risk
+Tier ordering rationale (CLEAR < … < THUNDERSTORM):
+    CLEAR                   — clear sky
+    CLOUDY                  — clouds, no precip
+    FOG                     — visibility hazard but no precip
+    DRIZZLE                 — light non-frozen precip
+    RAIN                    — significant non-frozen precip; flooding risk
+    SNOW                    — frozen precip + driving + cold-soak risk
+    FREEZING_PRECIPITATION  — ice accretion: power-line and road glaze
+    THUNDERSTORM            — precip + lightning + wind + hail risk
 
-Reasonable people could swap RAIN/SNOW; we put SNOW above RAIN because in the
-three monitored cities (all northern Canadian) snow is the more disruptive
-hazard category. The IntEnum is the single place to revisit if that call
-changes.
+Why FREEZING_PRECIPITATION sits ABOVE SNOW for these three cities: in
+Ottawa specifically, ice accretion (freezing rain / freezing drizzle) is
+the most disruptive winter hazard category — the 1998 North American Ice
+Storm is regional folklore, and even smaller events take down power lines
+and shut transit faster than an equivalent volume of snow does. Toronto
+sees less frequent but similar-magnitude events; Vancouver sees them
+rarely but they are catastrophic when they happen because the city is
+unprepared. Folding 56/57/66/67 into the plain RAIN tier (4) would
+under-rate the worst case the system needs to surface promptly.
+
+This ordering choice is the single place to revisit if domain assumptions
+change (e.g. the system is later deployed to subtropical cities where
+freezing precip is moot).
 """
 
 from __future__ import annotations
@@ -34,13 +47,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 
+from watchagent.logging_setup import get_logger
+
 
 class Tier(IntEnum):
     """Categorical severity tier with a strict ordering.
 
     Detector #5 fires when a reading transitions into a strictly higher tier
-    (CLEAR → THUNDERSTORM, CLOUDY → SNOW, etc.). Comparing tiers via ``>``
-    answers exactly that question.
+    (CLEAR → THUNDERSTORM, RAIN → FREEZING_PRECIPITATION, …). Comparing tiers
+    via ``>`` answers exactly that question.
     """
 
     CLEAR = 0
@@ -49,7 +64,8 @@ class Tier(IntEnum):
     DRIZZLE = 3
     RAIN = 4
     SNOW = 5
-    THUNDERSTORM = 6
+    FREEZING_PRECIPITATION = 6
+    THUNDERSTORM = 7
 
 
 class Severity(StrEnum):
@@ -69,6 +85,10 @@ class WeatherCode:
 
 
 # WMO 4677 codes Open-Meteo publishes. Source: https://open-meteo.com/en/docs.
+# Completeness against the published Open-Meteo set is asserted by
+# ``test_registry_covers_open_meteo_set`` so no code can be silently dropped
+# by a refactor — silent gaps would become invisible dead spots in the
+# detector-#5 transition logic.
 WMO_CODES: dict[int, WeatherCode] = {
     0:  WeatherCode(0,  "Clear sky",                  Tier.CLEAR,        Severity.LOW),
     1:  WeatherCode(1,  "Mainly clear",               Tier.CLOUDY,       Severity.LOW),
@@ -79,13 +99,16 @@ WMO_CODES: dict[int, WeatherCode] = {
     51: WeatherCode(51, "Light drizzle",              Tier.DRIZZLE,      Severity.LOW),
     53: WeatherCode(53, "Moderate drizzle",           Tier.DRIZZLE,      Severity.LOW),
     55: WeatherCode(55, "Dense drizzle",              Tier.DRIZZLE,      Severity.MEDIUM),
-    56: WeatherCode(56, "Light freezing drizzle",     Tier.DRIZZLE,      Severity.MEDIUM),
-    57: WeatherCode(57, "Dense freezing drizzle",     Tier.DRIZZLE,      Severity.HIGH),
+    # Freezing precipitation: tier elevated above SNOW, severity HIGH across
+    # all four codes — even "light" freezing drizzle can produce hazardous
+    # ice accretion on roads and overhead lines. See module docstring.
+    56: WeatherCode(56, "Light freezing drizzle",     Tier.FREEZING_PRECIPITATION, Severity.HIGH),
+    57: WeatherCode(57, "Dense freezing drizzle",     Tier.FREEZING_PRECIPITATION, Severity.HIGH),
     61: WeatherCode(61, "Slight rain",                Tier.RAIN,         Severity.LOW),
     63: WeatherCode(63, "Moderate rain",              Tier.RAIN,         Severity.MEDIUM),
     65: WeatherCode(65, "Heavy rain",                 Tier.RAIN,         Severity.HIGH),
-    66: WeatherCode(66, "Light freezing rain",        Tier.RAIN,         Severity.HIGH),
-    67: WeatherCode(67, "Heavy freezing rain",        Tier.RAIN,         Severity.HIGH),
+    66: WeatherCode(66, "Light freezing rain",        Tier.FREEZING_PRECIPITATION, Severity.HIGH),
+    67: WeatherCode(67, "Heavy freezing rain",        Tier.FREEZING_PRECIPITATION, Severity.HIGH),
     71: WeatherCode(71, "Slight snow fall",           Tier.SNOW,         Severity.LOW),
     73: WeatherCode(73, "Moderate snow fall",         Tier.SNOW,         Severity.MEDIUM),
     75: WeatherCode(75, "Heavy snow fall",            Tier.SNOW,         Severity.HIGH),
@@ -101,18 +124,51 @@ WMO_CODES: dict[int, WeatherCode] = {
 }
 
 
+# The canonical Open-Meteo emit set — used by tests to detect drift if a code
+# is added to (or dropped from) :data:`WMO_CODES` without updating the test.
+OPEN_METEO_PUBLISHED_CODES: frozenset[int] = frozenset(
+    {0, 1, 2, 3, 45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67,
+     71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99}
+)
+
+
+# First-sighting cache for unknown codes. Module-level so it dedupes across
+# every caller — first call to ``lookup(unknown)`` (or any helper that routes
+# through it) emits one INFO line; subsequent calls are silent. Test code can
+# call :func:`_clear_unknown_codes_cache` to reset between assertions.
+_seen_unknown_codes: set[int] = set()
+
+
+def _clear_unknown_codes_cache() -> None:
+    """Reset the first-sighting log dedup cache. Test-only helper."""
+    _seen_unknown_codes.clear()
+
+
 def lookup(code: int) -> WeatherCode | None:
-    """Return the :class:`WeatherCode` record for ``code`` or ``None`` if unknown."""
-    return WMO_CODES.get(code)
+    """Return the :class:`WeatherCode` record for ``code`` or ``None`` if unknown.
+
+    On the FIRST sighting of an unknown code, emits a one-shot INFO log so
+    operators learn that Open-Meteo started emitting something we don't map.
+    Subsequent sightings of the same code are silent.
+    """
+    rec = WMO_CODES.get(code)
+    if rec is None and code not in _seen_unknown_codes:
+        _seen_unknown_codes.add(code)
+        get_logger(__name__).info(
+            "weather_code.unknown",
+            weather_code=code,
+            note="not in WMO 4677 registry; tier-transition events suppressed",
+        )
+    return rec
 
 
 def tier_of(code: int) -> Tier | None:
-    rec = WMO_CODES.get(code)
+    rec = lookup(code)
     return rec.tier if rec is not None else None
 
 
 def severity_of(code: int) -> Severity | None:
-    rec = WMO_CODES.get(code)
+    rec = lookup(code)
     return rec.severity if rec is not None else None
 
 
@@ -121,7 +177,7 @@ def description_of(code: int) -> str:
 
     Falls back to ``"Unknown WMO code <n>"`` for codes Open-Meteo might add later.
     """
-    rec = WMO_CODES.get(code)
+    rec = lookup(code)
     return rec.description if rec is not None else f"Unknown WMO code {code}"
 
 
