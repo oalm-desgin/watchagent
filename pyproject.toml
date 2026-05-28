@@ -1,0 +1,37 @@
+# pyproject.toml — tool configuration only.
+#
+# We deliberately do NOT define a build-backend here: this project is run as an
+# application (uvicorn + asyncio task), not distributed as a wheel. Source lives
+# under `src/watchagent/` and is added to PYTHONPATH (locally via the pytest
+# `pythonpath` setting below; in Docker via the Dockerfile's PYTHONPATH env).
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+# E/F: pycodestyle/pyflakes (correctness)
+# I:   import sorting
+# B:   bugbear (catches likely bugs)
+# UP:  pyupgrade (modern syntax)
+# N:   pep8-naming
+# SIM: simplifications
+select = ["E", "F", "I", "B", "UP", "N", "SIM"]
+# Long lines are usually log messages or docstrings here — readability beats E501.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately reuse names and skip some naming conventions.
+"tests/**" = ["N802", "N803", "N806"]

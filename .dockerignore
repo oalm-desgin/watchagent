@@ -1,0 +1,46 @@
+# Mirrors .gitignore so secrets and dev-only artifacts NEVER land in the build context.
+# Without this, `docker build` would copy .env, *.db, .git/, and tests/ into the image
+# (credential-leak risk + ~10x slower builds).
+
+# Source-control / metadata
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Tests / docs / dev-only
+tests/
+*.md
+docs/
+
+# Local secrets / state — must never be in the image
+.env
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Python build / cache
+__pycache__/
+*.py[codz]
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
