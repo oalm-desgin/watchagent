@@ -1,0 +1,37 @@
+---
+description: Core invariants for the detection package (disjoint baseline, std==0 guard, debouncer separation, informative reasons)
+globs: src/watchagent/detection/**/*.py
+alwaysApply: false
+---
+
+# Editing the detection package
+
+`detection/` is the highest-value module in this project — the section where the design reasoning shows. The following invariants are what make it correct; preserve them and pin any new behaviour with tests.
+
+## Disjoint baseline (the spike-dampening trap)
+
+The z-score's baseline and the point it judges MUST be disjoint. In `engine.on_new_reading`, the current reading is added to the city's window with `state.add(reading)` **AFTER** all detectors have run — never before. `TemperatureAnomalyDetector.evaluate` reads `state.temperatures()` (the priors). Do not move `state.add` above the detector loop; folding the current reading into its own mean/std dampens the very anomaly you're detecting.
+
+## Guard `std == 0` explicitly
+
+`TemperatureAnomalyDetector` uses `statistics.stdev` (sample std, ddof=1) and returns `None` when `std < _STD_EPSILON` or not finite. Never divide by `std` without this guard — a flat overnight window produces `std=0` → `inf`/`nan` → crash or garbage event. This is a deliberate blind spot covered by `RapidTempChangeDetector` (which catches the same jump via |ΔT|/h); keep both, and keep `test_flat_window_with_real_spike_is_caught_by_rate` green.
+
+## Detectors are pure; the Debouncer owns time
+
+A detector's `evaluate(reading, state)` answers "does the condition hold?" — no time, no cooldown, no I/O. It returns a `CandidateEvent | None`. A NEW detector MUST integrate with `Debouncer.consume` via the engine, NOT track its own cooldown or last-fire timestamp. `on_new_reading` calls `debouncer.consume(city, event_type, condition_holds=candidate is not None)` for EVERY detector — including the `None` case, which is how the in-anomalous edge flag clears. Do not skip the `consume` call when a detector returns `None`.
+
+## Reason strings carry the numeric context
+
+Every `CandidateEvent.reason` must name the city, the observed value, the comparison, and the threshold (e.g. `"Ottawa 31.2°C is +3.1σ above its trailing-48 mean of 22.4°C (σ=2.8, threshold=±2.5σ)"`). The same numbers go in `context` as structured fields (`value`, `mean`, `std`, `z`, `z_threshold`, `window_size`, etc.). Do not reduce a reason to a bare label like "temp anomaly" — the reason string is the standout surface, and the API exposes it verbatim.
+
+## Severity values are the StrEnum set
+
+`severity` is one of `"low" | "medium" | "high"` (matching `weather_codes.Severity`). The API response model pins these via a `Literal`. Do not introduce other severity strings.
+
+## Bounded window + failure isolation
+
+`CityState` uses `deque(maxlen=W)` — keep it bounded so a long-running poller can't grow memory. In `on_new_reading`, each `detector.evaluate` is wrapped so a detector bug logs `detection.detector.error` and clears that detector's edge flag (`condition_holds=False`) instead of aborting the whole reading. Preserve that try/except — one detector must never take down the others.
+
+## Test discipline for a new detector
+
+A new detector needs BOTH a should-fire and a should-not-fire unit test in `tests/test_detection_detectors.py`, plus the engine wiring in `build_default_detectors`. Cross-city detectors are intentionally deferred (documented future work) — do not add per-city shared state to the existing detectors.

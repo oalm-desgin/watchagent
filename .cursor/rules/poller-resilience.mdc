@@ -1,0 +1,37 @@
+---
+description: Resilience invariants for the poll loop and Open-Meteo client (retry policy, gather handling, per-cycle counters)
+globs: src/watchagent/poller.py,src/watchagent/open_meteo.py
+alwaysApply: false
+---
+
+# Editing `poller.py` / `open_meteo.py`
+
+These two files own everything that can fail at runtime: network, upstream errors, malformed payloads. The error-handling shape here is intentional.
+
+## `run_forever` must never raise (except `CancelledError`)
+
+The loop catches `Exception` around `run_cycle` and keeps going; only `asyncio.CancelledError` breaks out, and it is re-raised so the lifespan's `task.cancel()` completes promptly. Do not let any other exception escape `run_forever` — a crash there silently stops all polling while `/health` keeps returning 200. (The lifespan attaches a `poller.task_died` done-callback as a backstop; do not rely on it instead of the in-loop guard.)
+
+## Retry only TRANSIENT failures — never 4xx
+
+In `open_meteo.fetch_current`, the split is deliberate and must be preserved:
+
+- Timeouts, `ConnectError`/`ReadError`/`NetworkError`, and **5xx** → retry with exponential backoff (`backoff_base_seconds * 2**(attempt-1)`).
+- **4xx → permanent.** Log once and return `None`. Do NOT add 4xx to the retry path — a 400/404 means the request is malformed or the resource is gone; retrying just burns the cycle.
+- Malformed JSON and partial/structurally-broken 200s → permanent (`return None`), not retried. An upstream serving HTML or nulls won't self-heal within the cycle.
+
+## `_parse_payload` stays defensive
+
+It returns `None` (with a WARNING) for: non-dict payload, missing `current` object, missing/non-int `utc_offset_seconds`, missing `current.time`, any of the five required fields `is None`, or a non-numeric field value (the `try/except (TypeError, ValueError)` around `Reading(...)`). Use `is None` checks, never truthiness — `precipitation=0.0` and `weather_code=0` are valid. Do not let a `KeyError`/`ValueError` escape into `_poll_city`.
+
+## `gather(return_exceptions=True)` results MUST be inspected
+
+`run_cycle` iterates the gather results and tests `isinstance(result, BaseException)`. `return_exceptions=True` does NOT handle exceptions — it stuffs them into the results list. Never treat every result as a success outcome; the per-city `BaseException` check is what keeps one bad city from killing the cycle.
+
+## Preserve the new / duplicate / error counters
+
+`CycleSummary.from_outcomes` tallies `new` / `duplicate` / `error` from each `PollOutcome.status`, and `run_cycle` logs them on `poller.cycle.done`. This is the observable proof that dedup works. Do not collapse these counts or stop emitting them — they are referenced in the README and the integration tests.
+
+## URL is built from a params dict, never f-strings
+
+`_params_for` returns a dict and httpx encodes it. Never interpolate query params into the URL string — that reintroduces the `&amp;` / unencoded-space class of bug. `test_request_url_uses_decoded_query_params_through_full_stack` pins this.

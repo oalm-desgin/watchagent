@@ -1,0 +1,24 @@
+---
+description: The local-vs-UTC time split that the whole system depends on for correct ordering and detection
+alwaysApply: true
+---
+
+# Timestamp discipline
+
+This convention is the spine of the system. It has shaped storage, the poller, detection, the API, and the lifespan. A single edit that breaks it in one place makes the system silently mis-sort or mis-detect — no exception, just wrong answers. Treat it as an invariant.
+
+## Two reading timestamps, two different meanings
+
+- `reading_time` — the **naive local civil time** Open-Meteo returns in `current.time` (e.g. `"2026-05-28T11:00"`, with `timezone=auto`). It is for display and for the `UNIQUE(city, reading_time)` dedup key. It is NEVER used for ordering or arithmetic.
+- `reading_time_utc` — the **absolute UTC** instant, computed at parse time by `storage.reading_time_to_utc(local, utc_offset_seconds)`. Format: `isoformat(timespec="seconds")` → `"2026-05-28T15:00:00+00:00"`.
+
+## Rules
+
+1. **All ordering and all cross-city or arithmetic operations use `reading_time_utc`.** Sorting, `since` filtering, rate-of-change deltas (`RapidTempChangeDetector` parses `reading_time_utc`), window hydration — all UTC. Never sort or compare on the local `reading_time`; Vancouver 13:00 (PDT) and Ottawa 13:00 (EDT) are 3 hours apart in reality.
+2. **`utc_offset_seconds` is a required field.** `open_meteo._parse_payload` skips the city if it's missing/non-int. A reading without it cannot have a correct `reading_time_utc`, so it must not be stored.
+3. **All stored UTC columns use one format.** `reading_time_utc`, `fetched_at`, `detected_at` are all produced via `isoformat(timespec="seconds")` on a UTC-aware datetime (`utc_now_iso()` / `reading_time_to_utc`). One format means SQLite's lexical TEXT sort equals chronological sort. Do not introduce microseconds, a `Z` suffix, or a different precision into these columns.
+4. **`since` is normalised before comparison.** The API's `_normalise_since` converts user input to that same column format and compares against `reading_time_utc`. Keep it that way.
+
+## Do not unify the log timestamp with the DB columns
+
+`structlog`'s `TimeStamper(fmt="iso", utc=True)` produces a DELIBERATELY different format (microseconds + `Z`) for log lines. It serves a different purpose (operator log correlation) than the DB columns (sortable storage). A future "make timestamps consistent" cleanup MUST NOT collapse these two — they are intentionally distinct.

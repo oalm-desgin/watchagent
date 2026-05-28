@@ -1,0 +1,31 @@
+---
+description: Structured-logging conventions every log line in the service must follow
+alwaysApply: true
+---
+
+# Structured logging conventions
+
+All logging goes through `structlog` configured in `logging_setup.py`. The output is JSON; consistency of the field schema is what makes `docker logs` greppable and the dedup story verifiable.
+
+## Use the project logger, emit events, never `print`
+
+- Get a logger via `get_logger(__name__)` (or `structlog.get_logger(__name__)`). Never use `print()` or the bare stdlib `logging` module for service output.
+- The first positional arg is the `event` — a stable, dotted, lowercase identifier (`poller.cycle.done`, `detection.event.fired`, `openmeteo.partial_payload`, `api.lifespan.startup.begin`). Do not put dynamic values in the event name; put them in keyword fields.
+- Everything else is structured keyword fields, not f-string interpolation into the message.
+
+## Carry the standard contextual fields
+
+When the relevant value is in scope, include it as a field so lines correlate:
+
+- `city` — on anything per-city.
+- `cycle_id` — on anything inside a poll cycle. The poller binds it via `structlog.contextvars.bound_contextvars` AND passes it explicitly to the cycle summary lines; the `merge_contextvars` processor propagates it to nested lines. Preserve both — `capture_logs()` in tests sees the explicit one.
+- `event_type` and `severity` — on anything detection-related.
+- `reading_time` / `reading_time_utc`, `http_status`, `attempt` — where applicable.
+
+## Errors carry `exc_info`
+
+When logging a caught exception, pass `exc_info` (e.g. `log.exception(...)` or `log.error(..., exc_info=exc)`) so the traceback is captured by `format_exc_info`. A bare error string without the traceback is a regression.
+
+## Do not reconfigure structlog globally outside `logging_setup`
+
+`configure_logging()` is the single place the pipeline is installed (idempotent via `_configured`). Never call `structlog.configure(...)` elsewhere — including in tests. A global reconfigure without restoration silently breaks `structlog.testing.capture_logs()` for every later test. Use `capture_logs()` (context-managed, self-restoring) to assert on logs instead.

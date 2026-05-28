@@ -1,0 +1,35 @@
+---
+description: Wire-contract invariants for the HTTP API (exact response shapes, shared connection, filter-not-lookup semantics)
+globs: src/watchagent/api/**/*.py
+alwaysApply: false
+---
+
+# Editing the API package
+
+The response shapes are a graded contract. Some of these are checked mechanically; a renamed key or an extra field is a hard failure, not a style nit.
+
+## Response models stay `extra="forbid"` with the exact key sets
+
+`ReadingOut`, `EventOut`, `ReadingsResponse`, `EventsResponse`, `HealthResponse` all set `model_config = ConfigDict(extra="forbid")`. Keep it — it makes an accidental extra field fail loudly. The locked shapes:
+
+- `GET /health` → exactly `{status, readings_stored, events_stored}`.
+- `GET /readings` → `{"readings": [...]}`; each row has ALL stored fields: `id, city, reading_time, reading_time_utc, fetched_at, temperature_2m, apparent_temperature, precipitation, wind_speed_10m, weather_code`.
+- `GET /events` → `{"events": [...]}`; each row: `id, city, event_type, reading_time, reading_time_utc, detected_at, severity, reason, context` (context is a nested JSON object).
+
+Do not rename the outer `readings` / `events` keys, drop `id`, or flatten `context`. `tests/test_api_contracts.py` asserts the exact key sets via `set(resp.json().keys()) == {...}`.
+
+## Borrow the shared connection — never open one per request
+
+Handlers depend on `get_db` (`Depends`), which returns `request.app.state.db` — the single connection the lifespan and poller share. Do not construct a `Database` inside a handler. Per-request connections defeat WAL and surface as `database is locked`.
+
+## Filters are filters, not lookups
+
+`city`, `type` (event_type), `severity` are OPTIONAL exact-match filters. An unknown value (`city=Atlantis`) returns an empty array at **200**, never 404 — it's a filter that matched nothing, not a missing resource.
+
+## `limit` is a validated bound with a default of 50
+
+`limit` is `Query(ge=1, le=500)` defaulting to `50`. A bare `GET /readings` (no params) must return up to 50 rows at 200. `limit=0` or `limit=600` must 422 via Pydantic. Do not make `limit` required (a bare request would then 422 — a contract violation) and do not widen the bounds silently.
+
+## `since` filters against `reading_time_utc`
+
+`_normalise_since` converts user input to the DB column format (`isoformat(timespec="seconds")`, UTC) so the WHERE clause is a clean string `>=`. The comparison is always against `reading_time_utc`, never the local `reading_time`. Keep naive input assumed-UTC and tz-aware input converted to UTC.

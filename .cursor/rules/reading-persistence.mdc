@@ -1,0 +1,37 @@
+---
+description: Invariants for the SQLite persistence layer (dedup gate, NOT NULL, UTC ordering, independent commits)
+globs: src/watchagent/storage.py
+alwaysApply: false
+---
+
+# Editing `storage.py`
+
+This file is load-bearing for dedup, ordering correctness, and crash safety. The following are invariants, not preferences.
+
+## The dedup gate — do not break it
+
+`insert_reading` MUST keep `INSERT ... ON CONFLICT(city, reading_time) DO NOTHING` and MUST keep returning the `cursor.rowcount == 1` boolean.
+
+- Do NOT rewrite this as `INSERT OR REPLACE` — that would overwrite an existing row and report it as new, silently corrupting the poller's `new` / `duplicate` cycle counters.
+- Do NOT replace it with a `try/except aiosqlite.IntegrityError` returning `True`/`False` — the `rowcount` signal is the contract the poller's `_poll_city` relies on to gate `on_new_reading` (detection runs only on genuinely new rows).
+- The `UNIQUE(city, reading_time)` constraint and the app-level boolean are defence-in-depth. Keep both; removing either is a regression.
+
+## Schema NOT NULL
+
+Every weather column plus `city`, `reading_time`, `reading_time_utc`, `fetched_at` is `NOT NULL`. The poller already skips partial payloads (`open_meteo._parse_payload` returns `None`), so the DB should never legitimately see a NULL. Keep the `NOT NULL` constraints — they turn "we promise not to insert partials" into "the DB physically refuses them". Adding a nullable weather column is a schema regression.
+
+## Ordering is always by `reading_time_utc`, never `reading_time`
+
+`reading_time` is local civil time (Vancouver 13:00 ≠ Ottawa 13:00 as absolute moments). Every "most recent first" path — `select_readings`, `select_events`, `recent_readings_for_city`, `latest_event` — orders by `reading_time_utc DESC`. Do not change any `ORDER BY` to `reading_time`; cross-city queries would mis-sort by ~3h. The `idx_readings_*_utc_desc` / `idx_events_*_utc_desc` indexes mirror this ordering — keep them aligned if you touch a query.
+
+## `recent_readings_for_city` returns the NEWEST N, oldest-first
+
+It does `ORDER BY reading_time_utc DESC LIMIT ?` then `reversed(rows)`. This is deliberate: hydration needs the most recent window replayed chronologically. Do not "simplify" it to `ORDER BY ... ASC LIMIT ?` — that returns the OLDEST N rows and would hydrate the z-score window from stale ancient data.
+
+## Independent commits
+
+`insert_reading` and `insert_event` each `commit()` on their own. Do not wrap them in a shared transaction — the poller commits the reading first, then runs detection; a detector failure must never roll back the raw reading. Raw data is more valuable than derived events.
+
+## Connection PRAGMAs
+
+`connect()` applies WAL + `synchronous=NORMAL` + `busy_timeout=5000`. Do not drop `busy_timeout` — without it, any second connection (a test, the data-analysis skill reading while the poller writes) turns a brief write-lock into an immediate `database is locked`. WAL is mandated by the spec.
