@@ -170,6 +170,81 @@ class TestHydration:
             d.hydrate("Ottawa", "wind", last_fire_at=naive)
 
 
+class TestObservedClearSemantics:
+    """The subtle decision: an observed condition_holds=False is the OR's
+    escape hatch in 'suppress until clears OR cooldown elapses'. So a
+    genuine clear-then-re-enter within the cooldown DOES fire, but a
+    continuously-held condition does NOT. Pin both directions explicitly
+    so the behaviour can't drift in a refactor."""
+
+    def test_observed_clear_then_re_enter_within_cooldown_fires(
+        self,
+        clock: FakeClock,
+    ) -> None:
+        """Sequence: True (fire) → False (clear) → True (within cooldown).
+
+        The clear at step 2 takes the OR's escape hatch — suppression is
+        over by the brief's reading. Step 3 is therefore a fresh edge
+        and fires, even though only 10 minutes have passed since the
+        original fire (well inside the 1h cooldown).
+        """
+        d = Debouncer(cooldown_seconds=3600, clock=clock)
+
+        assert d.consume("Ottawa", "wind", condition_holds=True) is True
+
+        clock.advance(minutes=5)
+        assert d.consume("Ottawa", "wind", condition_holds=False) is False
+
+        clock.advance(minutes=5)
+        assert d.consume("Ottawa", "wind", condition_holds=True) is True, (
+            "An observed clear is the OR's escape hatch — the next "
+            "True transition is a fresh edge and must fire even within "
+            "the cooldown window."
+        )
+
+    def test_continuous_hold_stays_suppressed_until_cooldown(
+        self,
+        clock: FakeClock,
+    ) -> None:
+        """The other side of the same coin: without an observed clear,
+        the cooldown is the only way out. 30 consecutive True readings
+        over 30 minutes must produce exactly one fire."""
+        d = Debouncer(cooldown_seconds=3600, clock=clock)
+
+        fires = 0
+        for _ in range(30):
+            if d.consume("Ottawa", "wind", condition_holds=True):
+                fires += 1
+            clock.advance(minutes=1)
+
+        assert fires == 1, (
+            "30 minutes of continuous anomaly inside a 60-minute "
+            "cooldown must produce exactly one event."
+        )
+
+    def test_two_genuinely_separate_events_both_fire(
+        self,
+        clock: FakeClock,
+    ) -> None:
+        """The README sentence: an event that fires, fully clears, and
+        re-occurs within the cooldown window IS two distinct events.
+        We don't treat the second as a duplicate just because the wall
+        clock hasn't ticked past the suppression window."""
+        d = Debouncer(cooldown_seconds=3600, clock=clock)
+
+        # Storm 1: blew through in 20 minutes.
+        assert d.consume("Ottawa", "wind", condition_holds=True) is True
+        clock.advance(minutes=20)
+        assert d.consume("Ottawa", "wind", condition_holds=False) is False
+
+        # Calm period.
+        clock.advance(minutes=10)
+
+        # Storm 2: a different storm, still within the original
+        # storm's cooldown window. Must fire.
+        assert d.consume("Ottawa", "wind", condition_holds=True) is True
+
+
 class TestZeroCooldown:
     def test_zero_cooldown_refires_every_anomalous_reading(
         self,

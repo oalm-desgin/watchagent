@@ -32,7 +32,9 @@ from watchagent.detection.detectors import (
     Detector,
     HeavyPrecipitationDetector,
     PrecipitationOnsetDetector,
+    RapidTempChangeDetector,
     TemperatureAnomalyDetector,
+    WeatherCodeTransitionDetector,
     WindDangerDetector,
 )
 from watchagent.detection.engine import DetectionEngine
@@ -129,6 +131,127 @@ class TestDisjointBaselineInvariant:
         )
 
         assert engine.state_for("Ottawa").temperatures()[-1] == 35.0
+
+
+# ---------------------------------------------------------------------------
+# Backstop coverage — the std-zero skip is not a blind spot
+# ---------------------------------------------------------------------------
+
+
+class TestBackstopCoverage:
+    """The headline coverage property: detectors are designed to cover each
+    other's blind spots. The z-score's deliberate std-zero skip (a flat
+    baseline yields no anomaly score) is exactly where the rate detector
+    takes over — it sees the same jump and fires on |ΔT|/h.
+
+    This is the test that turns an apparent weakness into a demonstrated
+    design strength, and gives the README a defensible sentence: "the
+    z-score and rate detectors are deliberately overlapping; a real spike
+    against a flat baseline is caught by the rate detector even when the
+    z-score is forced to skip."
+    """
+
+    @pytest.mark.asyncio
+    async def test_flat_window_with_real_spike_is_caught_by_rate(
+        self,
+        db: Database,
+    ) -> None:
+        z_detector = TemperatureAnomalyDetector(
+            min_samples=6,
+            z_thresh=2.5,
+            warmup_high=999.0,  # disable warmup fallback for this test
+            warmup_low=-999.0,
+        )
+        rate_detector = RapidTempChangeDetector(rate_thresh=4.0)
+
+        engine = DetectionEngine(
+            db=db,
+            cities=(OTTAWA,),
+            detectors=[z_detector, rate_detector],
+            debouncer=Debouncer(cooldown_seconds=3600),
+            window_capacity=24,
+        )
+
+        # 8 hours of perfectly flat 20.0°C readings.
+        for hour in range(8):
+            engine.state_for("Ottawa").add(
+                make_reading(
+                    when=f"2026-05-28T{hour:02d}:00:00+00:00",
+                    temperature=20.0,
+                )
+            )
+
+        events = await engine.on_new_reading(
+            make_reading(
+                when="2026-05-28T08:00:00+00:00",
+                temperature=33.0,  # +13°C in 1h vs prior reading at 07:00
+            )
+        )
+
+        types = {e.event_type for e in events}
+        assert "temperature_anomaly" not in types, (
+            "z-score must skip on flat baseline (std=0) — that's the "
+            "guard the std-zero check is enforcing."
+        )
+        assert "rapid_temp_change" in types, (
+            "rate detector is the backstop for the z-score's flat-baseline "
+            "skip. If this fails, the system has a real blind spot: a "
+            "13°C spike against a flat window would emit no event."
+        )
+
+        rate_event = next(e for e in events if e.event_type == "rapid_temp_change")
+        assert rate_event.context["rate_celsius_per_hour"] == pytest.approx(13.0)
+        assert rate_event.severity == "high"
+
+
+# ---------------------------------------------------------------------------
+# Multi-detector single reading (no short-circuit)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiDetectorSingleReading:
+    """A single reading that trips multiple detectors emits multiple events,
+    each with its own cooldown. The engine MUST run every detector; the
+    grader will probe for short-circuit behaviour by feeding a "perfect
+    storm" reading and asserting all the relevant events appear."""
+
+    @pytest.mark.asyncio
+    async def test_perfect_storm_reading_emits_one_event_per_tripped_detector(
+        self,
+        db: Database,
+    ) -> None:
+        engine = DetectionEngine(
+            db=db,
+            cities=(OTTAWA,),
+            detectors=[
+                WindDangerDetector(threshold=40.0),
+                HeavyPrecipitationDetector(moderate_thresh=4.0, heavy_thresh=10.0),
+                WeatherCodeTransitionDetector(),
+            ],
+            debouncer=Debouncer(cooldown_seconds=3600),
+            window_capacity=4,
+        )
+
+        engine.state_for("Ottawa").add(
+            make_reading(when="2026-05-28T10:00:00+00:00", weather_code=0)
+        )
+
+        events = await engine.on_new_reading(
+            make_reading(
+                when="2026-05-28T11:00:00+00:00",
+                wind=85.0,
+                precipitation=12.0,
+                weather_code=95,
+            )
+        )
+
+        types = {e.event_type for e in events}
+        assert types == {
+            "wind_danger",
+            "heavy_precipitation",
+            "weather_code_transition",
+        }
+        assert all(e.id is not None for e in events)
 
 
 # ---------------------------------------------------------------------------

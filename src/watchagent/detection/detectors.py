@@ -160,9 +160,23 @@ class TemperatureAnomalyDetector:
             return self._warmup_fallback(reading, n)
 
         mean = statistics.fmean(priors)
-        std = statistics.pstdev(priors)
+        # Sample std (Bessel's correction, ddof=1). The window is a *sample*
+        # of the city's recent behavior, not its full population — the city
+        # continues to exist outside the window. At W=48 the difference vs
+        # population std is ~1%, but during the warm-up-to-full ramp
+        # (n=6→48) sample std is meaningfully larger, which makes the
+        # z-score slightly more conservative when the baseline is shortest.
+        # statistics.stdev requires n ≥ 2, guaranteed by min_samples ≥ 2.
+        std = statistics.stdev(priors)
         if std < _STD_EPSILON or not math.isfinite(std):
             # Flat / degenerate window — z-score undefined; skip.
+            #
+            # NOTE: this is a deliberate blind spot covered by the rate
+            # detector. A flat baseline followed by a real jump produces
+            # std=0 → no temperature_anomaly event, but rapid_temp_change
+            # sees the same jump and fires on |ΔT|/h. The test
+            # ``TestBackstopCoverage.test_flat_window_with_real_spike_is_caught_by_rate``
+            # in test_detection_engine.py pins this property.
             return None
 
         z = (reading.temperature_2m - mean) / std

@@ -91,6 +91,25 @@ class TestHydrate:
         assert state.temperatures() == [2.0, 3.0]
 
 
+class TestBoundedMemory:
+    """Pin the memory invariant explicitly. A long-running poller MUST NOT
+    grow per-city state without bound; ``deque(maxlen=W)`` is what
+    enforces this. If somebody refactors the window to a list and
+    forgets to trim, this test catches it before production OOM does."""
+
+    def test_window_does_not_grow_past_capacity(self) -> None:
+        capacity = 10
+        state = CityState(city="Ottawa", capacity=capacity)
+        for i in range(capacity * 100):
+            state.add(_r("Ottawa", "2026-05-28T10:00:00+00:00", float(i)))
+        assert len(state) == capacity
+        assert len(state.window) == capacity
+        # And the surviving members are exactly the most-recent ones.
+        assert state.temperatures() == [
+            float(capacity * 100 - capacity + i) for i in range(capacity)
+        ]
+
+
 class TestDisjointBaselineInvariant:
     """The single most important behavioural test: when ``evaluate`` runs,
     the window does NOT contain the reading under evaluation. This is

@@ -161,6 +161,38 @@ class TestTemperatureAnomalyZScore:
         assert result is None
 
 
+class TestSampleStandardDeviation:
+    """Verify the z-score uses sample std (ddof=1), not population.
+
+    The window is a *sample* of the city's recent behavior, not the full
+    population. At W=48 the difference is ~1%, but during the warm-up
+    ramp (n=6→48) sample std is meaningfully larger and makes the
+    z-score slightly more conservative when the baseline is shortest.
+    """
+
+    def test_z_uses_sample_std_not_population(
+        self,
+        z_detector: TemperatureAnomalyDetector,
+    ) -> None:
+        # Six priors with hand-chosen values whose sample std and
+        # population std differ enough to distinguish the two.
+        priors_temps = [10.0, 12.0, 14.0, 16.0, 18.0, 20.0]
+        # mean = 15.0
+        # population std = sqrt(70/6) ≈ 3.4156
+        # sample std     = sqrt(70/5) ≈ 3.7417
+        priors = [make_reading(temperature=t) for t in priors_temps]
+        state = state_with(*priors)
+        result = z_detector.evaluate(make_reading(temperature=30.0), state)
+
+        assert result is not None
+        # value=30, mean=15, std≈3.7417 → z ≈ 4.0089 (sample) vs 4.39 (pop)
+        # The detector reports the std it actually used; we pin it to the
+        # sample value to lock in the choice.
+        assert result.context["std"] == pytest.approx(3.7417, abs=1e-3)
+        assert result.context["mean"] == pytest.approx(15.0)
+        assert result.context["z"] == pytest.approx(4.009, abs=1e-2)
+
+
 class TestStdZeroGuard:
     def test_flat_window_does_not_divide_by_zero(
         self, z_detector: TemperatureAnomalyDetector

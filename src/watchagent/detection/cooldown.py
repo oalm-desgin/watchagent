@@ -136,6 +136,47 @@ class Debouncer:
         detector returned ``None`` (``condition_holds=False``). That's how
         the in-anomalous flag clears: a non-anomalous reading drops it,
         re-arming the next 0→1 transition.
+
+        **Cooldown semantics (the subtle decision worth pinning explicitly).**
+
+        The brief says: "suppress re-fire UNTIL the condition clears OR
+        ``cooldown_seconds`` elapses". Read literally, the OR has *two*
+        escape hatches:
+
+        1. **Observed clear → re-enter.** If we observe a reading with
+           ``condition_holds=False`` and a later reading has
+           ``condition_holds=True``, we treat the second one as a fresh
+           edge and fire — even if the cooldown has not elapsed. The
+           observed clear is taken at face value as the OR's escape hatch:
+           by the brief's text, the suppression is over the moment we see
+           the condition no longer holds. (Pinned by
+           ``test_observed_clear_then_re_enter_within_cooldown_fires``.)
+
+           The flapping concern this raises is real but bounded: the
+           poller's hourly cadence is the floor against high-frequency
+           noise. A 10-second flap can never reach the detector — the
+           upstream sensor doesn't refresh that often, and our dedup
+           gate would reject duplicates anyway. So "fire on every
+           observed clear-and-re-enter" maps to "fire on every genuinely
+           separate hourly weather event", which is the intended behavior.
+
+        2. **Cooldown elapses on a sustained anomaly.** If
+           ``condition_holds`` is True every time we ask, we suppress
+           until ``cooldown_seconds`` has elapsed since the last fire,
+           then re-fire and reset the cooldown anchor. This is what
+           gives a 12-hour heatwave one event every 3 hours instead of
+           zero events after the first. (Pinned by
+           ``test_sustained_anomaly_refires_exactly_at_cooldown``.)
+
+        **Restart edge case (hydration).** After a process restart we
+        cannot replay the readings we missed, so we don't know whether
+        the condition cleared while we were down. ``hydrate`` resolves
+        this conservatively: if the previous fire is still inside the
+        cooldown window, we set ``in_anomalous=True`` so the next True
+        reading is treated as a continuation (suppressed), not a fresh
+        edge. This errs toward fewer events; the alternative —
+        re-firing every previously-anomalous condition immediately
+        after restart — would be a flood every time we deploy.
         """
         key = (city, event_type)
         st = self._states.setdefault(key, _DebounceState())
