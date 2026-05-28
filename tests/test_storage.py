@@ -161,6 +161,66 @@ async def test_connection_property_raises_when_not_connected(tmp_path: Path) -> 
         _ = db.connection
 
 
+@pytest.mark.asyncio
+async def test_wal_pragmas_are_actually_applied(db: Database) -> None:
+    """Pin the runtime pragma values, not just the SQL strings in the source.
+
+    journal_mode=WAL is mandated by the spec; busy_timeout=5000 prevents
+    second connections (e.g. the M10 data-analysis skill) from raising
+    SQLITE_BUSY on contention; synchronous=NORMAL is the documented
+    correct pairing with WAL.
+    """
+    async with db.connection.execute("PRAGMA journal_mode") as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == "wal"
+
+    async with db.connection.execute("PRAGMA busy_timeout") as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == 5000
+
+    async with db.connection.execute("PRAGMA synchronous") as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    # SQLite returns the integer code: NORMAL=1, FULL=2, OFF=0, EXTRA=3.
+    assert row[0] == 1, "synchronous should be NORMAL (1) — the WAL-paired value"
+
+    async with db.connection.execute("PRAGMA foreign_keys") as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_not_null_constraints_reject_partial_readings(db: Database) -> None:
+    """Defence in depth: even if the poller's partial-payload guard is bypassed,
+    the DB physically refuses NULL on any of the five weather fields."""
+    import sqlite3
+
+    sql = """
+    INSERT INTO readings
+        (city, reading_time, reading_time_utc, fetched_at,
+         temperature_2m, apparent_temperature, precipitation,
+         wind_speed_10m, weather_code)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        "Ottawa",
+        "2026-05-28T13:00",
+        "2026-05-28T17:00:00+00:00",
+        utc_now_iso(),
+        None,  # temperature_2m NULL — must be rejected.
+        19.0,
+        0.0,
+        10.0,
+        0,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        await db.connection.execute(sql, params)
+        await db.connection.commit()
+
+
 # ---------------------------------------------------------------------------
 # Dedup — the boolean that gates detection.
 # ---------------------------------------------------------------------------
@@ -307,20 +367,55 @@ async def test_count_readings_and_events(db: Database) -> None:
 
 
 @pytest.mark.asyncio
-async def test_recent_readings_for_city_returns_oldest_first(db: Database) -> None:
-    """Detector state replays readings in chronological order on startup,
-    so this helper hands them back oldest-first (the inverse of the
-    most-recent-first API contract)."""
-    for hour in range(10):
+async def test_recent_readings_for_city_returns_newest_window_oldest_first(
+    db: Database,
+) -> None:
+    """Hydration window must be the NEWEST W readings, replayed oldest→newest.
+
+    Subtle bug guard: a naive ``ORDER BY reading_time_utc ASC LIMIT W`` would
+    return the OLDEST W rows in the table. On a long-running DB that means
+    the z-score window hydrates from stale ancient data while the recent
+    readings are silently ignored — and the dead-window stays dead until
+    the next process restart.
+
+    The correct shape is "grab the newest W via DESC LIMIT W, then reverse
+    to chronological". This test seeds W+5 rows and asserts the window
+    contains hours 05..14 (the newest 10) and explicitly NOT hours 00..04.
+    """
+    # Seed 15 readings (W+5 with W=10).
+    for hour in range(15):
         await db.insert_reading(make_reading(reading_time=f"2026-05-28T{hour:02d}:00"))
 
-    window = await db.recent_readings_for_city("Ottawa", limit=5)
+    window = await db.recent_readings_for_city("Ottawa", limit=10)
+
+    expected_newest_ten = [f"2026-05-28T{h:02d}:00" for h in range(5, 15)]
+    actual = [r.reading_time for r in window]
+    assert actual == expected_newest_ten, (
+        f"Expected the NEWEST 10 readings (hours 05-14) replayed chronologically; "
+        f"got {actual}. If hours 00-04 appear, the query is grabbing the OLDEST W "
+        f"and the z-score detector will hydrate from stale ancient data."
+    )
+
+    # Belt-and-suspenders: make sure the oldest rows we explicitly excluded
+    # are NOT in the window.
+    excluded = {f"2026-05-28T{h:02d}:00" for h in range(0, 5)}
+    assert excluded.isdisjoint(actual)
+
+
+@pytest.mark.asyncio
+async def test_recent_readings_for_city_returns_all_when_fewer_than_limit(
+    db: Database,
+) -> None:
+    """If the DB has fewer than W rows for the city, return what we have —
+    detection's warm-up logic handles small windows."""
+    for hour in range(3):
+        await db.insert_reading(make_reading(reading_time=f"2026-05-28T{hour:02d}:00"))
+
+    window = await db.recent_readings_for_city("Ottawa", limit=10)
     assert [r.reading_time for r in window] == [
-        "2026-05-28T05:00",
-        "2026-05-28T06:00",
-        "2026-05-28T07:00",
-        "2026-05-28T08:00",
-        "2026-05-28T09:00",
+        "2026-05-28T00:00",
+        "2026-05-28T01:00",
+        "2026-05-28T02:00",
     ]
 
 

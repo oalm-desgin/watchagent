@@ -197,11 +197,28 @@ CREATE INDEX IF NOT EXISTS idx_events_utc_desc
     ON events(reading_time_utc DESC);
 """
 
-# Pragmas applied on every connect. WAL is the load-bearing one — it lets
-# readers proceed while the single writer is committing.
+# Pragmas applied on every connect. Each one is load-bearing:
+#
+# * journal_mode = WAL  — mandated by the spec; lets readers proceed while
+#   the single writer commits. Without it, every read blocks the writer.
+# * synchronous = NORMAL — the documented correct pairing with WAL: durable
+#   on a clean shutdown, slightly relaxed fsync semantics for performance.
+#   FULL would be needlessly expensive; OFF would risk corruption.
+# * busy_timeout = 5000 — the one people forget. With our single shared
+#   connection in-process we are mostly safe from lock contention, but the
+#   moment ANY second connection touches the DB (a test, the M10
+#   data-analysis skill running while the poller writes, a future
+#   sidecar reader) a missing busy_timeout turns a brief write-lock into
+#   an immediate `database is locked` SQLITE_BUSY exception. With this
+#   pragma SQLite waits up to 5s for the lock instead.
+# * foreign_keys = ON — defensive; we don't have FKs yet but enabling now
+#   means a future schema addition can rely on them.
+# * temp_store = MEMORY — keeps SQLite's intermediate tables off disk;
+#   small but free win on writes.
 _PRAGMAS = (
     "PRAGMA journal_mode = WAL;",
     "PRAGMA synchronous = NORMAL;",
+    "PRAGMA busy_timeout = 5000;",
     "PRAGMA foreign_keys = ON;",
     "PRAGMA temp_store = MEMORY;",
 )
