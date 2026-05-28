@@ -1,0 +1,77 @@
+# WatchAgent CI — three independent jobs so a lint failure does not hide
+# a test failure (or vice versa). Each job has its own timeout and reports
+# as a separate check in the GitHub Actions UI.
+#
+# §1 disqualifier: "green on the latest commit on main at submission time."
+# Every push to main after M12 should wait for this workflow to finish green.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# When you push several commits in quick succession (e.g. pre-submission
+# fixes), cancel stale runs so the latest commit's result lands first.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check src tests
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Pytest
+        run: pytest -q
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Brief §11: the image must build with zero env vars and zero
+      # build-args — no secrets, no network-at-build-time assumptions.
+      # Do not add `build-args:` or `secrets:` here; a future tweak
+      # that needs build-time config is out of policy for this check.
+      - name: Docker build
+        run: docker build .
