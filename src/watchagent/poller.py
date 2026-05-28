@@ -120,6 +120,13 @@ class Poller:
         and the loop continues; only ``asyncio.CancelledError`` (from the
         lifespan shutdown) breaks out, and that is re-raised so the awaiting
         lifespan can complete promptly.
+
+        Cadence is **fixed-delay** (sleep N AFTER the cycle finishes), not
+        fixed-rate (start every N regardless of cycle duration). At 600s
+        this never matters, but the discipline is deliberate: a future
+        short interval cannot let slow cycles stack up. ``asyncio.sleep``
+        is cancellable, so the lifespan's ``task.cancel()`` interrupts the
+        sleep promptly and shutdown does not wait the full interval.
         """
         log.info(
             "poller.starting",

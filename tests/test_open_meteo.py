@@ -306,6 +306,51 @@ async def test_fetch_current_bad_json_returns_none(
     assert route.call_count == 1
 
 
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_current_top_level_not_dict_returns_none(
+    fast_meteo: OpenMeteoClient,
+) -> None:
+    """200 + valid JSON but the body is a string/list (not an object).
+    Treated as malformed — permanent skip, no retry."""
+    route = respx.get("https://api.open-meteo.com/v1/forecast").mock(
+        return_value=httpx.Response(200, json="not an object")
+    )
+    assert await fast_meteo.fetch_current(OTTAWA) is None
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_current_missing_current_time_returns_none(
+    fast_meteo: OpenMeteoClient,
+) -> None:
+    payload = _good_payload()
+    del payload["current"]["time"]  # type: ignore[index]
+    route = respx.get("https://api.open-meteo.com/v1/forecast").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    assert await fast_meteo.fetch_current(OTTAWA) is None
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_current_non_numeric_temperature_returns_none(
+    fast_meteo: OpenMeteoClient,
+) -> None:
+    """Defence in depth: even if Open-Meteo returns "NA" in a numeric slot,
+    the parse must catch the conversion error and return None — never let
+    a ValueError surface as poller.unhandled_exception."""
+    payload = _good_payload()
+    payload["current"]["temperature_2m"] = "NA"  # type: ignore[index]
+    route = respx.get("https://api.open-meteo.com/v1/forecast").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    assert await fast_meteo.fetch_current(OTTAWA) is None
+    assert route.call_count == 1, "non-numeric is permanent — no retry"
+
+
 # ---------------------------------------------------------------------------
 # Cross-city UTC computation.
 # ---------------------------------------------------------------------------

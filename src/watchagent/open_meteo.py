@@ -294,14 +294,30 @@ class OpenMeteoClient:
             )
             return None
 
-        return Reading(
-            city=city.name,
-            reading_time=reading_time_local,
-            reading_time_utc=reading_time_to_utc(reading_time_local, utc_offset),
-            fetched_at=utc_now_iso(),
-            temperature_2m=float(current["temperature_2m"]),
-            apparent_temperature=float(current["apparent_temperature"]),
-            precipitation=float(current["precipitation"]),
-            wind_speed_10m=float(current["wind_speed_10m"]),
-            weather_code=int(current["weather_code"]),
-        )
+        # Final defence: if any numeric slot holds something we can't coerce
+        # (e.g. "NA", a list, an object), treat the response as malformed —
+        # permanent skip, not a retry. A misbehaving upstream is unlikely to
+        # start returning numbers within the cycle, and a KeyError/ValueError
+        # leaking out would surface as `poller.unhandled_exception`, which
+        # wastes a slot in the gather safety net.
+        try:
+            return Reading(
+                city=city.name,
+                reading_time=reading_time_local,
+                reading_time_utc=reading_time_to_utc(reading_time_local, utc_offset),
+                fetched_at=utc_now_iso(),
+                temperature_2m=float(current["temperature_2m"]),
+                apparent_temperature=float(current["apparent_temperature"]),
+                precipitation=float(current["precipitation"]),
+                wind_speed_10m=float(current["wind_speed_10m"]),
+                weather_code=int(current["weather_code"]),
+            )
+        except (TypeError, ValueError) as exc:
+            log.warning(
+                "openmeteo.malformed_payload",
+                city=city.name,
+                reason="non_numeric_field_value",
+                error=str(exc),
+                reading_time=reading_time_local,
+            )
+            return None
