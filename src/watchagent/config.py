@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     min_samples: int = Field(6, ge=2, description="warm-up sample threshold")
     z_thresh: float = Field(2.5, gt=0)
 
+    # Warm-up safety thresholds — used when the per-city window has fewer
+    # than MIN_SAMPLES readings (cold start, fresh DB) and the z-score
+    # baseline is statistically meaningless. These are deliberately
+    # conservative absolute values for Canadian cities: anything ≥35 °C
+    # or ≤−30 °C is notable regardless of any baseline.
+    warmup_temp_high: float = Field(35.0, description="warm-up fallback °C high")
+    warmup_temp_low: float = Field(-30.0, description="warm-up fallback °C low")
+
     # --- Detection: rapid rate-of-change ---------------------------------
     rate_thresh: float = Field(4.0, gt=0, description="°C / hour")
 
@@ -49,6 +57,13 @@ class Settings(BaseSettings):
 
     # --- Detection: apparent-vs-actual divergence ------------------------
     divergence_thresh: float = Field(5.0, gt=0, description="°C")
+
+    # --- Detection: heavy precipitation ----------------------------------
+    # mm/h thresholds. moderate_thresh is the fire bar for the
+    # heavy-precipitation detector; heavy_thresh raises severity to "high".
+    # Onset (0 → >0) is its own detector with its own event type.
+    precip_moderate_thresh: float = Field(4.0, gt=0, description="mm / hour")
+    precip_heavy_thresh: float = Field(10.0, gt=0, description="mm / hour")
 
     # --- Debounce / cooldown ---------------------------------------------
     cooldown_seconds: int = Field(10800, ge=0, description="per (city, event_type)")
@@ -69,6 +84,20 @@ class Settings(BaseSettings):
                 f"MIN_SAMPLES ({self.min_samples}) must be <= W ({self.w}); "
                 "otherwise the warm-up gate never clears and the z-score "
                 "detector silently never fires."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_precip_bands(self) -> Settings:
+        """``precip_heavy_thresh`` should sit at or above ``precip_moderate_thresh``.
+
+        If the bands are inverted, severity assignment is degenerate: every
+        moderate fire would also be "high", which defeats the band entirely.
+        """
+        if self.precip_heavy_thresh < self.precip_moderate_thresh:
+            raise ValueError(
+                f"precip_heavy_thresh ({self.precip_heavy_thresh}) must be "
+                f">= precip_moderate_thresh ({self.precip_moderate_thresh})"
             )
         return self
 
