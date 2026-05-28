@@ -128,17 +128,21 @@ class TestPollerScheduling:
         self,
         settings_with_poller: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Tripwire test: the poller's done_callback MUST log at ERROR
         level if the task dies for any reason other than CancelledError.
         Without this, an exception that escapes the per-city try/except
         would kill the task silently, /health would keep returning 200,
         and readings_stored would freeze - the kind of failure that's
-        invisible until somebody notices the data isn't fresh."""
-        import logging
+        invisible until somebody notices the data isn't fresh.
 
-        import structlog
+        Uses ``structlog.testing.capture_logs`` rather than reconfiguring
+        the global structlog factory; the latter pollutes other tests'
+        ``capture_logs()`` calls (e.g. ``test_poller.py``) and is the
+        kind of cross-test bleed M9's TestPerTestDatabaseIsolation pins
+        for the DB layer.
+        """
+        from structlog.testing import capture_logs
 
         from watchagent.poller import Poller
 
@@ -147,36 +151,20 @@ class TestPollerScheduling:
 
         monkeypatch.setattr(Poller, "run_forever", _crash_immediately)
 
-        # Route structlog through stdlib logging so caplog can see it.
-        # (Our production setup does the same via LoggerFactory; this
-        # just reaffirms the route is hot for the test.)
-        structlog.configure(
-            processors=[
-                structlog.processors.add_log_level,
-                structlog.processors.format_exc_info,
-                structlog.processors.JSONRenderer(),
-            ],
-            wrapper_class=structlog.stdlib.BoundLogger,
-            logger_factory=structlog.stdlib.LoggerFactory(),
-            cache_logger_on_first_use=False,
-        )
-
-        app = create_app(settings_with_poller)
-        with caplog.at_level(logging.ERROR):
+        with capture_logs() as cap:
+            app = create_app(settings_with_poller)
             async with app.router.lifespan_context(app):
                 # Pump the event loop so the poller starts, crashes, and
                 # the done_callback fires.
                 await asyncio.sleep(0.05)
 
-        # The structlog event name is the searchable signal.
-        assert any(
-            "poller.task_died" in record.message
-            for record in caplog.records
-        ), (
+        died = [c for c in cap if c.get("event") == "poller.task_died"]
+        assert len(died) == 1, (
             "Silent poller death must produce a 'poller.task_died' ERROR "
             "log line via the task's done_callback. Without it, the "
-            "background task can crash and nobody notices."
+            f"background task can crash and nobody notices. Got: {cap}"
         )
+        assert died[0].get("log_level") == "error", died[0]
 
 
 # ---------------------------------------------------------------------------
