@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/oalm-desgin/watchagent/actions/workflows/ci.yml/badge.svg)](https://github.com/oalm-desgin/watchagent/actions/workflows/ci.yml)
 
+> See [`DESIGN.md`](./DESIGN.md) for the architectural decisions behind each subsystem and the failure modes they prevent.
+
 WatchAgent polls live weather for **Ottawa, Toronto, and Vancouver** from Open-Meteo, stores readings in SQLite, runs seven per-city detectors on genuinely new rows, and exposes the results over a small HTTP API. One Python process: a background poller and FastAPI share a single `aiosqlite` connection; detection state hydrates from the database on startup so restarts do not flood duplicate events.
 
 ---
