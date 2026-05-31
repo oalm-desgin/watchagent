@@ -1,5 +1,7 @@
 # Design Decisions
 
+![WatchAgent architecture — single FastAPI process, poller, storage, detection engine, and SQLite on a named volume](./docs/architecture.png)
+
 This document records the load-bearing architectural decisions in WatchAgent, the failure modes each one prevents, and the tests that pin the resulting invariants. It complements the README's overview and event-detection sections by going deeper into the *why* behind each choice.
 
 The system is deliberately a single FastAPI process: one event loop, one shared `aiosqlite` connection, one shared `httpx.AsyncClient`, and an `asyncio` background task for polling. The alternative considered was a multi-service design with Postgres and a separate poller container. For the time budget, the highest-impact failure mode is the clean-clone disqualifier, and a single process has dramatically less surface area to break on a cold `docker compose up`.
