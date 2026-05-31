@@ -388,6 +388,11 @@ def render_table(result: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Force UTF-8 stdout so non-ASCII output (delta, sigma, degree signs)
+    # survives a cp1252 host stdout (e.g. Windows). No-op where stdout is
+    # already UTF-8 (Linux / the Docker container).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--db", default="watchagent.db", help="path to the SQLite DB")
     p.add_argument("--mode", required=True, choices=sorted(MODES))
